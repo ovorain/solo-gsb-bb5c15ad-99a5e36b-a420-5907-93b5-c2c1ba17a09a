@@ -459,6 +459,140 @@ class UsageReportResponse(BaseModel):
     busiest_window: Annotated[BusiestWindow, Field(description="全局最忙窗口")]
 
 
+class FairnessRequest(SimRequest):
+    """单次试算请求（公平性分析）：在 SimRequest 基础上携带主体与权重。
+
+    principal: 请求归属的主体（租户/调用方）标识
+    weight: 该主体的公平份额权重；同一 principal 的全部请求必须声明相同 weight
+    """
+
+    principal: Annotated[str, Field(min_length=1, description="请求归属的主体标识")]
+    weight: Annotated[float, Field(gt=0, description="公平份额权重，必须为正数")]
+
+    @field_validator("weight", mode="before")
+    @classmethod
+    def _validate_weight(cls, value):
+        if not _is_finite_number(value):
+            raise ValueError("weight 必须是有限数值")
+        if value <= 0:
+            raise ValueError("weight 必须为正数")
+        return value
+
+
+class FairnessReportRequest(UsageReportRequest):
+    """POST /fairness-report 请求体：/usage-report 请求体，requests 携带 principal 与 weight。
+
+    桶与窗口字段、跨字段校验（重复桶、未知引用、重复请求 ID、window_seconds）
+    全部沿用 UsageReportRequest；额外要求同一 principal 的 weight 一致。
+    """
+
+    requests: Annotated[
+        list[FairnessRequest], Field(min_length=1, description="按时间戳模拟的请求序列")
+    ]
+
+    @model_validator(mode="after")
+    def _check_principal_weight_consistency(self):
+        errors: list[dict] = []
+        declared: dict[str, float] = {}
+        for r_index, request in enumerate(self.requests):
+            weight = float(request.weight)
+            if request.principal in declared:
+                if declared[request.principal] != weight:
+                    errors.append(
+                        {
+                            "type": "inconsistent_weight",
+                            "loc": ("requests", r_index, "weight"),
+                            "msg": (
+                                f"principal {request.principal!r} 的 weight 不一致: "
+                                f"首次声明为 {declared[request.principal]}，此处为 {weight}"
+                            ),
+                            "input": request.weight,
+                        }
+                    )
+            else:
+                declared[request.principal] = weight
+        if errors:
+            raise RequestValidationErrors(errors)
+        return self
+
+
+class PrincipalFairness(BaseModel):
+    """单个 principal 在某一统计范围（全局或单窗口）内的公平性统计。"""
+
+    principal: str
+    weight: Annotated[float, Field(description="该 principal 的公平份额权重")]
+    allowed_consumption: Annotated[
+        float, Field(description="范围内放行请求的 cost 合计（实际获得量，每个请求计一次）")
+    ]
+    rejected_count: Annotated[int, Field(description="范围内被原子拒绝的请求数")]
+    expected_share: Annotated[
+        float, Field(description="理论权重份额 = 范围内总放行消耗 × 自身权重占比")
+    ]
+    attainment_ratio: Annotated[
+        float | None,
+        Field(description="实际获得量 / 理论权重份额；范围内总放行消耗为 0 时为 null"),
+    ]
+    shortfall: Annotated[
+        float, Field(description="相对理论份额的缺口 = max(0, expected_share - allowed_consumption)")
+    ]
+
+
+class ConstrainedPrincipal(BaseModel):
+    """最受限 principal：理论份额存在缺口者中达成率最低的主体，及其短缺证据。"""
+
+    principal: str
+    attainment_ratio: Annotated[
+        float | None, Field(description="实际获得量 / 理论权重份额")
+    ]
+    shortfall: Annotated[float, Field(description="相对理论份额的缺口")]
+    first_shortage_bucket: Annotated[
+        str | None,
+        Field(description="造成其短缺的首个桶：范围内首个被拒请求的限制桶；无拒绝时为 null"),
+    ]
+    first_shortage_request_id: Annotated[
+        str | None, Field(description="范围内首个被拒请求的 ID；无拒绝时为 null")
+    ]
+    first_shortage_timestamp: Annotated[
+        float | None, Field(description="范围内首个被拒请求的时间戳；无拒绝时为 null")
+    ]
+
+
+class FairnessWindowReport(WindowRange):
+    """单个窗口的公平性报告（只统计窗口内有请求的活跃 principal）。"""
+
+    jain_index: Annotated[
+        float, Field(description="窗口内活跃 principal 的加权 Jain 公平指数（[0, 1]）")
+    ]
+    principals: Annotated[
+        list[PrincipalFairness], Field(description="窗口内活跃 principal 的统计，按首次出现顺序")
+    ]
+    most_constrained: Annotated[
+        ConstrainedPrincipal | None,
+        Field(description="窗口内最受限 principal；无人存在理论缺口时为 null"),
+    ]
+
+
+class FairnessReportResponse(BaseModel):
+    window_seconds: Annotated[float, Field(description="统计窗口宽度（秒）")]
+    window_count: Annotated[int, Field(description="覆盖请求时间跨度的窗口总数")]
+    windows: Annotated[
+        list[WindowRange], Field(description="全部窗口的起止时间，按窗口序号升序")
+    ]
+    jain_index: Annotated[
+        float, Field(description="全局加权 Jain 公平指数（[0, 1]，按全部 principal 的实际获得量）")
+    ]
+    principals: Annotated[
+        list[PrincipalFairness], Field(description="全局逐 principal 统计，按首次出现顺序")
+    ]
+    most_constrained: Annotated[
+        ConstrainedPrincipal | None,
+        Field(description="全局最受限 principal；无人存在理论缺口时为 null"),
+    ]
+    window_reports: Annotated[
+        list[FairnessWindowReport], Field(description="逐窗口公平性报告，按窗口序号升序")
+    ]
+
+
 class ReservationBucket(BaseModel):
     """预留试算桶定义：只有容量上限，没有补充概念。
 

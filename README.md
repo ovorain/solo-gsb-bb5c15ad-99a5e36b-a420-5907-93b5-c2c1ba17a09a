@@ -15,6 +15,8 @@
 
 以及 **区间预留试算** 接口 `POST /reservation-simulate`：给定只有容量上限（无补充概念）的桶与一批携带 `start` / `end` / `cost` / `chain` 的区间预留，按 `start` 升序处理；仅当预留的整个半开区间 `[start, end)` 内链上每个桶的并发占用加 `cost` 处处不超过 `capacity` 时才**原子接受**，否则拒绝且不改变任何占用。返回按原始输入索引排列的逐项结果，以及每个桶**合并后的占用区间**与**峰值并发**。
 
+以及 **公平性报告** 接口 `POST /fairness-report`：请求体在 `/usage-report` 基础上为每个请求附加 `principal`（主体）与 `weight`（公平份额权重），沿用与 `/simulate` 完全一致的时间排序、连续补充与链式原子扣减回放，按 principal 统计**放行消耗**、**拒绝次数**与**加权 Jain 公平指数**；并按 `window_seconds` 将每个窗口的实际获得量与理论权重份额对齐，找出**最受限 principal** 及造成其短缺的**首个桶**，同时给出全局与逐窗口报告。
+
 ## 一条命令启动
 
 需要已安装 Docker（含 Compose 插件）。在本目录执行：
@@ -33,6 +35,7 @@ docker compose up --build
 | 规划接口 | http://localhost:8000/plan-initial-balances （POST） |
 | 使用分析接口 | http://localhost:8000/usage-report （POST） |
 | 预留试算接口 | http://localhost:8000/reservation-simulate （POST） |
+| 公平性报告接口 | http://localhost:8000/fairness-report （POST） |
 | Swagger 交互文档 | http://localhost:8000/docs |
 | ReDoc 文档 | http://localhost:8000/redoc |
 
@@ -423,6 +426,98 @@ docker compose up --build
 - index 0 接受；index 1 与 index 0 在 `[2,3)` 重叠，`room_b` 容量 1 放不下第二笔，被原子拒绝（`room_a` 也不留占用）；
 - index 2、3 接受：`room_a` 在 `[6,7)` 峰值并发 2；index 4 在 t=7 与 index 3 端点相接（半开，不并发），链上均有空位，接受。
 
+## 请求格式 `POST /fairness-report`
+
+请求体 = `/usage-report` 请求体（`buckets` + `requests` + `window_seconds`），其中每个请求额外携带 `principal` 与 `weight`。接口按与 `/simulate` 完全相同的时间排序、连续补充与链式原子扣减回放请求序列，再按 principal 统计公平性指标。
+
+```json
+{
+  "buckets": [
+    {"id": "tenant_quota", "capacity": 100, "refill_rate": 10, "initial": 100},
+    {"id": "api_qps", "capacity": 5, "refill_rate": 5}
+  ],
+  "requests": [
+    {"id": "req-1", "timestamp": 0, "cost": 4, "chain": ["tenant_quota", "api_qps"], "principal": "alice", "weight": 1},
+    {"id": "req-2", "timestamp": 0.5, "cost": 4, "chain": ["tenant_quota", "api_qps"], "principal": "bob", "weight": 1},
+    {"id": "req-3", "timestamp": 1, "cost": 4, "chain": ["tenant_quota", "api_qps"], "principal": "alice", "weight": 1},
+    {"id": "req-4", "timestamp": 3, "cost": 4, "chain": ["tenant_quota"], "principal": "bob", "weight": 1}
+  ],
+  "window_seconds": 2
+}
+```
+
+### 字段说明
+
+`buckets`、`window_seconds` 同 `/usage-report`；`requests[]` 在 `/simulate` 字段（`id` / `timestamp` / `cost` / `chain`）之外新增：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `principal` | 是 | 请求归属的主体（租户/调用方）标识，非空字符串 |
+| `weight` | 是 | 该主体的公平份额权重，必须为正的有限数值；同一 `principal` 的全部请求必须声明相同 `weight`，否则返回 422（`inconsistent_weight`） |
+
+### 统计语义
+
+1. **回放一致**：放行/拒绝判定与 `/simulate` 完全一致（时间戳升序、同刻按输入顺序；连续补充封顶 `capacity`；链上任一桶不足则全部不扣）。
+2. **放行消耗** `allowed_consumption`：该 principal 放行请求的 `cost` 合计（每个请求计一次，与链上桶数无关），即该主体的**实际获得量**。
+3. **拒绝次数** `rejected_count`：该 principal 被原子拒绝的请求数。
+4. **理论权重份额** `expected_share`：统计范围内总放行消耗 ×（自身权重 ÷ 范围内各 principal 权重之和）。全局范围的权重和覆盖全部 principal；单窗口只覆盖窗口内有请求的**活跃 principal**。
+5. **达成率** `attainment_ratio` = 实际获得量 ÷ 理论权重份额；范围内总放行消耗为 0 时无法定义，为 `null`。
+6. **缺口** `shortfall` = `max(0, expected_share − allowed_consumption)`。
+7. **加权 Jain 公平指数** `jain_index`：`J = (Σxᵢ)² ÷ (Σwᵢ · Σ(xᵢ²/wᵢ))`，其中 `xᵢ` 为各 principal 实际获得量、`wᵢ` 为权重；获得量与权重严格成比例时取 1，完全不均时趋近 0。权重全相等时退化为经典 Jain 指数。范围内总放行消耗为 0（全员为零，完全相等）时按约定返回 1。
+8. **窗口划分**：与 `/usage-report` 相同——以最早请求时刻为原点的半开窗口 `[t_start + k·window_seconds, t_start + (k+1)·window_seconds)`，边界上的请求属于右侧窗口，每个请求只计入一个窗口。
+9. **最受限 principal** `most_constrained`：范围内存在理论缺口（`shortfall > 0`）者中**达成率最低**的主体；并列时取缺口较大者，再并列取 principal 名字典序较小者。无人存在缺口（完全对齐或总放行消耗为 0）时为 `null`。
+10. **短缺证据**：`first_shortage_bucket` / `first_shortage_request_id` / `first_shortage_timestamp` 为最受限 principal 在范围内**按处理顺序首个被拒请求**的限制桶（`rejected_by`）、请求 ID 与时间戳；该 principal 在范围内无拒绝时三者均为 `null`（短缺完全由他人超份额获得造成）。
+11. **全局与逐窗口**：响应同时给出全局报告（`jain_index` / `principals` / `most_constrained`，覆盖全部 principal，按请求中首次出现顺序排列）与逐窗口报告 `window_reports`（每窗只统计窗口内活跃 principal）。
+
+### 响应示例
+
+```json
+{
+  "window_seconds": 2.0,
+  "window_count": 2,
+  "windows": [
+    {"index": 0, "start": 0.0, "end": 2.0},
+    {"index": 1, "start": 2.0, "end": 4.0}
+  ],
+  "jain_index": 0.9,
+  "principals": [
+    {"principal": "alice", "weight": 1.0, "allowed_consumption": 8.0, "rejected_count": 0, "expected_share": 6.0, "attainment_ratio": 1.333333333, "shortfall": 0.0},
+    {"principal": "bob", "weight": 1.0, "allowed_consumption": 4.0, "rejected_count": 1, "expected_share": 6.0, "attainment_ratio": 0.666666667, "shortfall": 2.0}
+  ],
+  "most_constrained": {
+    "principal": "bob",
+    "attainment_ratio": 0.666666667,
+    "shortfall": 2.0,
+    "first_shortage_bucket": "api_qps",
+    "first_shortage_request_id": "req-2",
+    "first_shortage_timestamp": 0.5
+  },
+  "window_reports": [
+    {
+      "index": 0, "start": 0.0, "end": 2.0,
+      "jain_index": 0.5,
+      "principals": [
+        {"principal": "alice", "weight": 1.0, "allowed_consumption": 8.0, "rejected_count": 0, "expected_share": 4.0, "attainment_ratio": 2.0, "shortfall": 0.0},
+        {"principal": "bob", "weight": 1.0, "allowed_consumption": 0.0, "rejected_count": 1, "expected_share": 4.0, "attainment_ratio": 0.0, "shortfall": 4.0}
+      ],
+      "most_constrained": {"principal": "bob", "attainment_ratio": 0.0, "shortfall": 4.0, "first_shortage_bucket": "api_qps", "first_shortage_request_id": "req-2", "first_shortage_timestamp": 0.5}
+    },
+    {
+      "index": 1, "start": 2.0, "end": 4.0,
+      "jain_index": 1.0,
+      "principals": [
+        {"principal": "bob", "weight": 1.0, "allowed_consumption": 4.0, "rejected_count": 0, "expected_share": 4.0, "attainment_ratio": 1.0, "shortfall": 0.0}
+      ],
+      "most_constrained": null
+    }
+  ]
+}
+```
+
+- 全局：alice 获 8、bob 获 4（req-2 在 t=0.5 被 `api_qps` 原子拒绝），等权重下理论份额各 6 → 加权 Jain = 12² ÷ (2 × (8² + 4²)) = 0.9；bob 达成率最低（≈0.667），其短缺的首个桶为 `api_qps`；
+- 窗口 0 `[0, 2)`：bob 实际获得 0、理论份额 4 → 达成率 0，窗口 Jain = 0.5；
+- 窗口 1 `[2, 4)`：仅 bob 活跃且足额获得 → Jain = 1，无人受限（`most_constrained` 为 `null`）。
+
 ## 校验规则（HTTP 422）
 
 以下非法输入都会被拒绝，错误体统一为 `{"detail": [ {"type", "loc", "msg", ...}, ... ]}`：
@@ -430,11 +525,13 @@ docker compose up --build
 - **重复桶**：`buckets[].id` 重复（`duplicate_bucket`）；
 - **非法速率/容量**：`capacity <= 0`、`refill_rate < 0`、非有限数值、`initial`/`balance` 越界；
 - **未知引用**：`chain` 引用了未在 `buckets` 中定义的 ID（`unknown_bucket_ref`）；
-- **非法窗口宽度**：`window_seconds` 缺失、非有限数值或 `<= 0`（仅 `/usage-report`）；
+- **非法窗口宽度**：`window_seconds` 缺失、非有限数值或 `<= 0`（仅 `/usage-report` 与 `/fairness-report`）；
 - **非法预留区间**：`start` / `end` 非有限数值，或 `end <= start`（仅 `/reservation-simulate`）；
+- **非法主体/权重**：`principal` 为空字符串，`weight` 缺失、非有限数值或 `<= 0`（仅 `/fairness-report`）；
+- **权重不一致**：同一 `principal` 的请求声明了不同的 `weight`（`inconsistent_weight`，仅 `/fairness-report`）；
 - 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 系接口）、多余字段（`extra="forbid"`）。
 
-以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report` 与 `/reservation-simulate` 同时生效（按各自字段；`/plan-initial-balances` 与 `/usage-report` 复用 `/simulate` 的请求模型与全部跨字段校验；`/reservation-simulate` 使用独立的容量桶模型）。
+以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/reservation-simulate` 与 `/fairness-report` 同时生效（按各自字段；`/plan-initial-balances` 与 `/usage-report` 复用 `/simulate` 的请求模型与全部跨字段校验；`/fairness-report` 在 `/usage-report` 请求模型上扩展 `principal`/`weight` 字段与权重一致性校验；`/reservation-simulate` 使用独立的容量桶模型）。
 
 ## 本地调用示例
 
@@ -458,6 +555,10 @@ curl -X POST http://localhost:8000/usage-report \
 curl -X POST http://localhost:8000/reservation-simulate \
   -H 'Content-Type: application/json' \
   -d @examples/reservation-simulate.json
+
+curl -X POST http://localhost:8000/fairness-report \
+  -H 'Content-Type: application/json' \
+  -d @examples/fairness-report.json
 ```
 
 ## 不使用 Docker 的本地开发（可选）
@@ -486,6 +587,7 @@ pytest -q
 │   ├── planner.py       # 初始余额规划引擎（反推最低 initial）
 │   ├── usage.py         # 配额使用分析引擎（按窗口统计消耗/拒绝/峰值占用）
 │   ├── reservation.py   # 区间预留试算引擎（容量受限的链上原子预留）
+│   ├── fairness.py      # 公平性报告引擎（加权 Jain 指数、窗口份额对齐、最受限主体定位）
 │   └── errors.py        # 跨字段校验错误类型
 ├── tests/               # pytest 测试（引擎语义 + HTTP）
 ├── examples/request.json
@@ -493,6 +595,7 @@ pytest -q
 ├── examples/plan-initial-balances.json
 ├── examples/usage-report.json
 ├── examples/reservation-simulate.json
+├── examples/fairness-report.json
 ├── requirements.txt
 ├── Dockerfile           # 依赖安装在镜像构建阶段完成
 ├── docker-compose.yml   # 单命令启动，映射 8000 端口
