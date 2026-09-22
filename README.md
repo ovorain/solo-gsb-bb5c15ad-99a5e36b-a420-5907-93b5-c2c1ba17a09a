@@ -13,6 +13,8 @@
 
 以及 **配额使用分析** 接口 `POST /usage-report`：请求体在 `/simulate` 基础上增加 `window_seconds`，按与 `/simulate` 完全一致的连续补充与链式原子判定回放请求序列，再按时间窗口统计每个桶的**放行消耗**、**拒绝次数**与**峰值占用**（= `capacity` − 窗口内最低余额），并给出每桶达到峰值的窗口起止时间与全局最忙窗口。
 
+以及 **主体公平性分析** 接口 `POST /fairness-report`：请求在 `/simulate` 的请求字段上增加 `principal`（归属主体）与 `weight`（主体权重，缺省 1），按与 `/simulate` 完全一致的时间排序、连续补充与链式原子判定回放后，按主体统计**放行消耗（实际获得量）**、**拒绝次数**，并以理论权重份额（= 窗口/全局全部放行消耗 × `weight / Σweight`）对齐实际获得量，计算**加权 Jain 公平指数**，找出**最受限主体**及按处理顺序**首个造成其短缺的桶**；响应同时给出**跨全部窗口的全局报告**与**逐窗口报告**（窗口划分语义与 `/usage-report` 一致）。
+
 以及 **区间预留试算** 接口 `POST /reservation-simulate`：给定只有容量上限（无补充概念）的桶与一批携带 `start` / `end` / `cost` / `chain` 的区间预留，按 `start` 升序处理；仅当预留的整个半开区间 `[start, end)` 内链上每个桶的并发占用加 `cost` 处处不超过 `capacity` 时才**原子接受**，否则拒绝且不改变任何占用。返回按原始输入索引排列的逐项结果，以及每个桶**合并后的占用区间**与**峰值并发**。
 
 ## 一条命令启动
@@ -32,6 +34,7 @@ docker compose up --build
 | 预测接口 | http://localhost:8000/forecast （POST） |
 | 规划接口 | http://localhost:8000/plan-initial-balances （POST） |
 | 使用分析接口 | http://localhost:8000/usage-report （POST） |
+| 公平性分析接口 | http://localhost:8000/fairness-report （POST） |
 | 预留试算接口 | http://localhost:8000/reservation-simulate （POST） |
 | Swagger 交互文档 | http://localhost:8000/docs |
 | ReDoc 文档 | http://localhost:8000/redoc |
@@ -338,6 +341,125 @@ docker compose up --build
 - 窗口 1 `[2, 4)`：req-4 只走 `tenant_quota`；`api_qps` 无事件，余额补满 → 占用回落到 0；
 - 最忙窗口为窗口 0：跨桶放行消耗 8 + 8 = 16。
 
+## 请求格式 `POST /fairness-report`
+
+请求体 = `/simulate` 请求体（`buckets` + `requests`，桶字段与跨字段校验完全一致）+ `window_seconds`；其中每个 `requests[]` 在 `/simulate` 字段之上增加 `principal` 与 `weight`。接口按与 `/simulate` 相同的时间排序、连续补充与链式原子判定回放请求序列，再按主体（principal）与时间窗口做公平性统计。
+
+```json
+{
+  "buckets": [
+    {"id": "shared_qps", "capacity": 4, "refill_rate": 1, "initial": 4}
+  ],
+  "requests": [
+    {"id": "req-1", "timestamp": 0, "cost": 3, "chain": ["shared_qps"], "principal": "alpha", "weight": 1},
+    {"id": "req-2", "timestamp": 0, "cost": 3, "chain": ["shared_qps"], "principal": "beta", "weight": 1},
+    {"id": "req-3", "timestamp": 1, "cost": 3, "chain": ["shared_qps"], "principal": "beta", "weight": 1},
+    {"id": "req-4", "timestamp": 5, "cost": 2, "chain": ["shared_qps"], "principal": "alpha", "weight": 1},
+    {"id": "req-5", "timestamp": 5, "cost": 2, "chain": ["shared_qps"], "principal": "beta", "weight": 1}
+  ],
+  "window_seconds": 5
+}
+```
+
+### 字段说明
+
+**顶层**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `buckets` | 是 | 同 `/simulate` |
+| `requests` | 是 | 请求序列，字段在 `/simulate` 基础上增加 `principal` / `weight`（见下表） |
+| `window_seconds` | 是 | 统计窗口宽度（秒），必须为正的有限数值；否则返回 422 |
+
+**请求 `requests[]`**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` / `timestamp` / `cost` / `chain` | 是 | 同 `/simulate` |
+| `principal` | 是 | 请求归属主体（租户/用户/调用方 ID），非空字符串 |
+| `weight` | 否 | 主体权重，必须为正的有限数值，缺省为 `1.0`；同一 `principal` 的权重在整个请求序列中必须一致，否则返回 422（`inconsistent_principal_weight`） |
+
+### 公平性语义
+
+1. **窗口划分**：与 `/usage-report` 完全一致——以最早请求时刻 `t_start` 为原点，窗口 `k` 为半开区间 `[t_start + k·window_seconds, t_start + (k+1)·window_seconds)`，边界上的请求属于右侧窗口；逐窗口报告只统计**该窗口内出现过**的主体，全局报告覆盖全部主体（按主体首次请求的处理顺序排列）。
+2. **回放一致**：放行/拒绝判定与 `/simulate` 完全一致（时间戳升序、同刻按输入顺序；连续补充封顶 `capacity`；链上任一桶不足则全部不扣）。
+3. **实际获得量** `allowed_consumption`：主体在该范围（窗口/全局）内所有**放行**请求的 `cost` 合计——注意每个放行请求给主体计一次 `cost`，而不是链上每桶各计一次。
+4. **理论权重份额** `theoretical_share`：`该范围全部放行消耗 × weight / Σweight`，其中 `Σweight` 只对该范围内出现过的主体求和。`weight` 全部为 1 时即等份额（总消耗的 1/n）。
+5. **短缺**：`deficit = max(0, theoretical_share − allowed_consumption)`，`deficit_ratio = deficit / theoretical_share`（理论份额为 0 时为 0）。
+6. **加权 Jain 公平指数** `weighted_jain_index`：
+
+   $$J = \frac{(\sum_i x_i)^2}{(\sum_i w_i)\left(\sum_i \frac{x_i^2}{w_i}\right)}$$
+
+   其中 $x_i$ 为主体 $i$ 的实际获得量、$w_i$ 为其权重；取值 `(0, 1]`，各主体获得量严格按权重比例分配时为 1，越接近 0 越不公平。等权重（$w_i = 1$）时退化为经典 Jain 指数 $(\sum x_i)^2 / (n \sum x_i^2)$。该范围全部获得量为 0 时指数定义为 0。
+7. **最受限主体** `most_constrained_principal`：在该范围**有被拒请求**的主体中，取短缺比例最高者（全部主体获得量均为 0 时按彻底短缺、比例 1 处理）；短缺比例并列时取**首次拒绝时刻最早**（同刻按输入顺序）的主体。没有任何被拒且短缺的主体时为 `null`——已拿到不少于份额的主体即使后续请求被拒，也不视为受限。
+8. **首个短缺桶** `first_shortfall`：最受限主体按处理顺序的**第一个被拒请求**，给出请求 ID/下标/时间戳、链上第一个余额不足的桶 `bucket_id`、`cost` 与判定时刻该桶余额 `available`；逐窗口报告中取的是**该窗口内**的首个短缺拒绝。
+
+### 响应示例
+
+```json
+{
+  "window_seconds": 5.0,
+  "window_count": 2,
+  "windows": [
+    {"index": 0, "start": 0.0, "end": 5.0},
+    {"index": 1, "start": 5.0, "end": 10.0}
+  ],
+  "global_report": {
+    "principal_count": 2,
+    "request_count": 5,
+    "allowed_count": 3,
+    "rejected_count": 2,
+    "allowed_consumption": 7.0,
+    "weighted_jain_index": 0.844827586,
+    "most_constrained_principal": "beta",
+    "first_shortfall": {
+      "request_id": "req-2", "index": 1, "timestamp": 0.0,
+      "bucket_id": "shared_qps", "cost": 3.0, "available": 1.0
+    },
+    "principals": [
+      {"principal": "alpha", "weight": 1.0, "request_count": 2, "allowed_count": 2, "rejected_count": 0,
+       "allowed_consumption": 5.0, "theoretical_share": 3.5, "deficit": 0.0, "deficit_ratio": 0.0},
+      {"principal": "beta", "weight": 1.0, "request_count": 3, "allowed_count": 1, "rejected_count": 2,
+       "allowed_consumption": 2.0, "theoretical_share": 3.5, "deficit": 1.5, "deficit_ratio": 0.428571429}
+    ]
+  },
+  "window_reports": [
+    {
+      "index": 0, "start": 0.0, "end": 5.0,
+      "principal_count": 2, "request_count": 3, "allowed_count": 1, "rejected_count": 2,
+      "allowed_consumption": 3.0, "weighted_jain_index": 0.5,
+      "most_constrained_principal": "beta",
+      "first_shortfall": {
+        "request_id": "req-2", "index": 1, "timestamp": 0.0,
+        "bucket_id": "shared_qps", "cost": 3.0, "available": 1.0
+      },
+      "principals": [
+        {"principal": "alpha", "weight": 1.0, "request_count": 1, "allowed_count": 1, "rejected_count": 0,
+         "allowed_consumption": 3.0, "theoretical_share": 1.5, "deficit": 0.0, "deficit_ratio": 0.0},
+        {"principal": "beta", "weight": 1.0, "request_count": 2, "allowed_count": 0, "rejected_count": 2,
+         "allowed_consumption": 0.0, "theoretical_share": 1.5, "deficit": 1.5, "deficit_ratio": 1.0}
+      ]
+    },
+    {
+      "index": 1, "start": 5.0, "end": 10.0,
+      "principal_count": 2, "request_count": 2, "allowed_count": 2, "rejected_count": 0,
+      "allowed_consumption": 4.0, "weighted_jain_index": 1.0,
+      "most_constrained_principal": null, "first_shortfall": null,
+      "principals": [
+        {"principal": "alpha", "weight": 1.0, "request_count": 1, "allowed_count": 1, "rejected_count": 0,
+         "allowed_consumption": 2.0, "theoretical_share": 2.0, "deficit": 0.0, "deficit_ratio": 0.0},
+        {"principal": "beta", "weight": 1.0, "request_count": 1, "allowed_count": 1, "rejected_count": 0,
+         "allowed_consumption": 2.0, "theoretical_share": 2.0, "deficit": 0.0, "deficit_ratio": 0.0}
+      ]
+    }
+  ]
+}
+```
+
+- 窗口 0 `[0, 5)`：req-1（alpha，cost 3）放行后余额 1；req-2、req-3（beta，各 cost 3）连续补充后仍不足，均被原子拒绝 → alpha 拿到 3、beta 拿到 0，等权 Jain 指数 0.5，beta 短缺比例 1.0 为最受限主体，首个短缺桶为 t=0 时余额仅 1 的 `shared_qps`；
+- 窗口 1 `[5, 10)`：t=5 桶已补满，alpha、beta 各放行一笔 cost 2 → 严格等份额，Jain 指数 1，无最受限主体；
+- 全局：alpha 获得 5、beta 获得 2（理论份额各 3.5），加权 Jain 指数 ≈ 0.845，beta 仍为最受限主体。
+
 ## 请求格式 `POST /reservation-simulate`
 
 ```json
@@ -430,11 +552,12 @@ docker compose up --build
 - **重复桶**：`buckets[].id` 重复（`duplicate_bucket`）；
 - **非法速率/容量**：`capacity <= 0`、`refill_rate < 0`、非有限数值、`initial`/`balance` 越界；
 - **未知引用**：`chain` 引用了未在 `buckets` 中定义的 ID（`unknown_bucket_ref`）；
-- **非法窗口宽度**：`window_seconds` 缺失、非有限数值或 `<= 0`（仅 `/usage-report`）；
+- **非法窗口宽度**：`window_seconds` 缺失、非有限数值或 `<= 0`（`/usage-report` 与 `/fairness-report`）；
+- **非法主体字段**（仅 `/fairness-report`）：`principal` 缺失或不是非空字符串；`weight` 非有限数值或 `<= 0`；同一 `principal` 在不同请求中权重不一致（`inconsistent_principal_weight`）；
 - **非法预留区间**：`start` / `end` 非有限数值，或 `end <= start`（仅 `/reservation-simulate`）；
 - 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 系接口）、多余字段（`extra="forbid"`）。
 
-以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report` 与 `/reservation-simulate` 同时生效（按各自字段；`/plan-initial-balances` 与 `/usage-report` 复用 `/simulate` 的请求模型与全部跨字段校验；`/reservation-simulate` 使用独立的容量桶模型）。
+以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report` 与 `/reservation-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型）。
 
 ## 本地调用示例
 
@@ -454,6 +577,10 @@ curl -X POST http://localhost:8000/plan-initial-balances \
 curl -X POST http://localhost:8000/usage-report \
   -H 'Content-Type: application/json' \
   -d @examples/usage-report.json
+
+curl -X POST http://localhost:8000/fairness-report \
+  -H 'Content-Type: application/json' \
+  -d @examples/fairness-report.json
 
 curl -X POST http://localhost:8000/reservation-simulate \
   -H 'Content-Type: application/json' \
@@ -485,6 +612,7 @@ pytest -q
 │   ├── forecast.py      # 等待时间预测引擎（不扣减状态）
 │   ├── planner.py       # 初始余额规划引擎（反推最低 initial）
 │   ├── usage.py         # 配额使用分析引擎（按窗口统计消耗/拒绝/峰值占用）
+│   ├── fairness.py      # 主体公平性分析引擎（加权 Jain 指数/最受限主体/首个短缺桶）
 │   ├── reservation.py   # 区间预留试算引擎（容量受限的链上原子预留）
 │   └── errors.py        # 跨字段校验错误类型
 ├── tests/               # pytest 测试（引擎语义 + HTTP）
@@ -492,6 +620,7 @@ pytest -q
 ├── examples/forecast.json
 ├── examples/plan-initial-balances.json
 ├── examples/usage-report.json
+├── examples/fairness-report.json
 ├── examples/reservation-simulate.json
 ├── requirements.txt
 ├── Dockerfile           # 依赖安装在镜像构建阶段完成

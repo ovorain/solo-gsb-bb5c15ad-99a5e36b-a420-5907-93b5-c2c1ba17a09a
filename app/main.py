@@ -7,8 +7,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.errors import RequestValidationErrors
+from app.fairness import fairness_report
 from app.forecast import forecast
 from app.models import (
+    FairnessReportRequest,
+    FairnessReportResponse,
     ForecastRequest,
     ForecastResponse,
     PlanInitialBalancesResponse,
@@ -32,6 +35,8 @@ app = FastAPI(
         "另提供 /forecast：在不扣减状态的前提下，预测桶链首次同时满足成本所需的等待时间；"
         "/plan-initial-balances：以全部请求放行为目标，反推各桶所需的最低初始余额；"
         "/usage-report：按时间窗口统计各桶的放行消耗、拒绝次数与峰值占用；"
+        "/fairness-report：按 principal 统计放行消耗与拒绝次数，给出加权 Jain "
+        "公平指数、最受限主体及其首个短缺桶（全局与逐窗口）；"
         "以及 /reservation-simulate：按 start 升序对区间预留做容量受限的链上原子试算，"
         "返回逐项结果与每桶合并后的占用区间、峰值并发。"
     ),
@@ -60,6 +65,7 @@ def root():
         "forecast": "/forecast",
         "plan_initial_balances": "/plan-initial-balances",
         "usage_report": "/usage-report",
+        "fairness_report": "/fairness-report",
         "reservation_simulate": "/reservation-simulate",
     }
 
@@ -87,6 +93,11 @@ def plan_initial_balances_endpoint(payload: SimulateRequest) -> PlanInitialBalan
 @app.post("/usage-report", response_model=UsageReportResponse, tags=["usage"])
 def usage_report_endpoint(payload: UsageReportRequest) -> UsageReportResponse:
     return usage_report(payload)
+
+
+@app.post("/fairness-report", response_model=FairnessReportResponse, tags=["fairness"])
+def fairness_report_endpoint(payload: FairnessReportRequest) -> FairnessReportResponse:
+    return fairness_report(payload)
 
 
 @app.post(
